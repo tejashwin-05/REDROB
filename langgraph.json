@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "ranking_pipeline": "./src/graph/workflow.py:graph"
+  },
+  "env": ".env"
+}

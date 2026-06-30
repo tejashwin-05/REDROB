@@ -2,6 +2,8 @@
 
 An intelligent candidate ranking pipeline that ranks 100K candidates the way a great recruiter would — using semantic understanding, behavioral signals, and LLM reasoning.
 
+---
+
 ## Architecture
 
 ```
@@ -9,38 +11,38 @@ Job Description (.docx)
         │
         ▼
 ┌─────────────────┐
-│  1. load_jd     │  Read + parse job description file
+│  1. load_jd     │  Read job description file (.docx / .txt)
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  2. parse_jd    │  Groq LLM extracts structured requirements
-└────────┬────────┘  (skills, experience, responsibilities, disqualifiers)
+│  2. parse_jd    │  Groq LLM extracts structured requirements:
+└────────┬────────┘  skills, experience, responsibilities, disqualifiers
          │
          ▼
 ┌──────────────────────┐
-│  3. load_candidates  │  Stream 100K JSONL candidates into memory
+│  3. load_candidates  │  Stream 100K JSONL candidates into memory (~9s)
 └──────────┬───────────┘
            │
            ▼
 ┌──────────────────────┐
-│  4. embedding_filter │  FAISS + BGE-small: retrieve top-500 semantically
-└──────────┬───────────┘  similar candidates (cached to disk)
-           │
+│  4. embedding_filter │  ChromaDB + BAAI/bge-small-en-v1.5:
+└──────────┬───────────┘  semantic search over 100K in 0.06s → top-500
+           │              (falls back to TF-IDF if ChromaDB not built)
            ▼
 ┌──────────────────────┐
-│  5. signal_scorer    │  Score Redrob behavioral signals:
+│  5. signal_scorer    │  Score 6 Redrob behavioral signal components:
 └──────────┬───────────┘  engagement, reliability, availability,
            │              profile quality, activity, skill validation
            ▼
 ┌──────────────────────┐
-│  6. hybrid_ranker    │  Combine: 45% semantic + 30% signal + 25% skill match
-└──────────┬───────────┘  + experience gate → top-150
-           │
+│  6. hybrid_ranker    │  Fuse scores:
+└──────────┬───────────┘  45% semantic + 30% signals + 25% skill match
+           │              + experience gate → top-150
            ▼
 ┌──────────────────────┐
-│  7. llm_reranker     │  Groq llama-3.3-70b reranks top-150 in batches of 10
-└──────────┬───────────┘  Final = 60% LLM + 40% hybrid
+│  7. llm_reranker     │  Groq llama-3.3-70b reranks top-150 in batches
+└──────────┬───────────┘  Final = 60% LLM score + 40% hybrid score
            │
            ▼
 ┌──────────────────────┐
@@ -48,145 +50,214 @@ Job Description (.docx)
 └──────────────────────┘
 ```
 
+---
+
 ## Tech Stack
 
 | Component | Technology |
 |-----------|-----------|
 | Orchestration | LangGraph (StateGraph) |
 | LLM | Groq `llama-3.3-70b-versatile` |
-| Stage-1 Retrieval | TF-IDF + cosine similarity (scikit-learn, CPU, instant) |
-| Stage-2 Rerank (optional) | `BAAI/bge-small-en-v1.5` via fastembed ONNX |
+| Embeddings | `BAAI/bge-small-en-v1.5` (sentence-transformers, free, local CPU) |
+| Vector DB | ChromaDB (persistent, HNSW index) |
+| Fallback Retrieval | TF-IDF + cosine similarity (scikit-learn) |
 | Fuzzy Skill Match | RapidFuzz |
 | Data Models | Pydantic v2 |
 | Package Manager | uv |
 | Python | 3.14 |
 
+---
+
 ## Quick Start
 
 ```bash
-# Install dependencies
+# 1. Clone and install
+git clone https://github.com/tejashwin-05/REDROB.git
+cd REDROB
 uv sync
 
-# Run the full pipeline
+# 2. Add your Groq API key
+cp .env.example .env
+# Edit .env → GROQ_API_KEY="your_key_here"
+
+# 3. Build the semantic index (one-time, ~5 hours on CPU)
+#    Embeds all 100K candidates into ChromaDB using BGE-small
+uv run python embed_candidates.py
+
+# 4. Run the ranking pipeline
 uv run python main.py
 
-# Force rebuild FAISS index (first run or after data changes)
-uv run python main.py --rebuild-index
-
-# Validate output
+# 5. Validate the output
 uv run python India_runs_data_and_ai_challenge/validate_submission.py output/submission.csv
 ```
 
-## LangGraph Studio
+---
 
-To visualize and debug the workflow graph:
+## Commands
 
 ```bash
-# Install LangGraph CLI
-uv add langgraph-cli
+# First run — build TF-IDF fallback index (if ChromaDB not ready)
+uv run python main.py --rebuild-index
 
-# Launch LangGraph Studio (opens browser)
+# Normal run — uses ChromaDB if available, TF-IDF otherwise
+uv run python main.py
+
+# Custom options
+uv run python main.py --top-k 500 --top-n 150 --output my_submission.csv
+
+# LangGraph Studio — visualise the workflow graph
 uv run langgraph dev
 ```
 
-The `langgraph.json` file points Studio to `src/graph/workflow.py:graph`.
+**CLI flags:**
 
-## CLI Options
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--candidates` | `India_runs_data_and_ai_challenge/candidates.jsonl` | Path to candidates dataset |
+| `--jd` | `India_runs_data_and_ai_challenge/job_description.docx` | Job description file |
+| `--output` | `output/submission.csv` | Output CSV path |
+| `--cache-dir` | `cache/` | Directory for ChromaDB and TF-IDF cache |
+| `--top-k` | `500` | Candidates retrieved by embedding search |
+| `--top-n` | `150` | Candidates passed to LLM reranker |
+| `--rebuild-index` | `False` | Force rebuild TF-IDF index |
 
+---
+
+## Two-Step Setup: Embeddings + Pipeline
+
+### Step 1 — Build ChromaDB (one-time)
+
+```bash
+uv run python embed_candidates.py
 ```
---candidates   Path to candidates.jsonl  [default: India_runs_data_and_ai_challenge/candidates.jsonl]
---jd           Path to job description   [default: India_runs_data_and_ai_challenge/job_description.docx]
---output       Output CSV path           [default: output/submission.csv]
---cache-dir    FAISS cache directory     [default: cache/]
---top-k        Embedding retrieval count [default: 500]
---top-n        Candidates sent to LLM    [default: 150]
---rebuild-index  Force FAISS rebuild     [default: False]
+
+- Reads all 100K candidates from `candidates.jsonl`
+- Encodes each candidate into a 384-dim vector using `BAAI/bge-small-en-v1.5`
+- Stores vectors + metadata in `cache/chroma_db/` (~600MB)
+- Takes ~5 hours on CPU (once done, never needs to run again)
+- If `cache/chroma_db/` already exists with 100K entries, it skips automatically
+
+### Step 2 — Run the Pipeline
+
+```bash
+uv run python main.py
 ```
+
+The pipeline auto-detects ChromaDB and uses semantic search. If ChromaDB isn't built yet, it falls back to TF-IDF automatically.
+
+---
+
+## LangGraph Studio
+
+Visualise and debug the full 8-node workflow graph:
+
+```bash
+uv run langgraph dev
+```
+
+Opens a browser UI at `http://localhost:8123`. The `langgraph.json` config points to `src/graph/workflow.py:graph`.
+
+---
 
 ## Folder Structure
 
 ```
 REDROB/
 ├── main.py                          # Pipeline entry point
+├── embed_candidates.py              # One-time ChromaDB index builder
 ├── langgraph.json                   # LangGraph Studio config
-├── pyproject.toml                   # uv project config
-├── .env                             # GROQ_API_KEY
+├── pyproject.toml                   # uv project + dependencies
+├── .env.example                     # API key template
+├── README.md
 ├── src/
 │   ├── data/
-│   │   ├── loader.py                # Streaming JSONL loader (100K candidates)
+│   │   ├── loader.py                # JSONL + JSON array loader (100K)
 │   │   └── jd_reader.py             # .docx / .txt JD reader
 │   ├── models/
-│   │   ├── candidate.py             # Pydantic: Candidate, Skills, Signals...
+│   │   ├── candidate.py             # Pydantic: Candidate, Skills, Signals
 │   │   ├── job_description.py       # Pydantic: JobDescription, ParsedJD
 │   │   └── scoring.py               # Pydantic: CandidateScore, RankingResult
 │   ├── pipeline/
-│   │   ├── jd_parser.py             # Groq LLM JD understanding
-│   │   ├── embedding_filter.py      # FAISS semantic retrieval
+│   │   ├── jd_parser.py             # Groq LLM → structured JD requirements
+│   │   ├── embedding_filter.py      # ChromaDB semantic search (+ TF-IDF fallback)
 │   │   ├── signal_scorer.py         # Redrob behavioral signal scoring
-│   │   ├── hybrid_ranker.py         # Semantic + signal + skill fusion
+│   │   ├── hybrid_ranker.py         # Semantic + signal + skill match fusion
 │   │   ├── llm_reranker.py          # Groq LLM batch reranking with reasoning
 │   │   └── output_writer.py         # Submission CSV writer + validator
 │   ├── graph/
 │   │   ├── state.py                 # LangGraph TypedDict state
-│   │   ├── nodes.py                 # Node functions (8 pipeline steps)
+│   │   ├── nodes.py                 # 8 pipeline node functions
 │   │   └── workflow.py              # StateGraph wiring + `graph` export
 │   └── utils/
 │       ├── text_utils.py            # Candidate/JD text builders for embedding
 │       └── logging_utils.py         # Structured logger
-├── cache/                           # FAISS index + candidate IDs (auto-generated)
-├── output/                          # submission.csv (auto-generated)
-└── India_runs_data_and_ai_challenge/
-    ├── candidates.jsonl             # 100K candidate profiles
-    ├── job_description.docx         # Target role JD
-    └── ...
+├── cache/
+│   ├── chroma_db/                   # ChromaDB semantic index (100K × 384-dim)
+│   ├── tfidf_vectorizer.pkl         # TF-IDF fallback (auto-built)
+│   └── tfidf_matrix.npz             # TF-IDF matrix (auto-built)
+└── output/
+    └── submission.csv               # Final ranked output (100 rows)
 ```
 
-## Performance (actual benchmark on 100K candidates)
-
-| Node | Time |
-|------|------|
-| Load JD | ~1s |
-| Parse JD (Groq) | ~5s |
-| Load 100K candidates | ~44s |
-| TF-IDF index build + search | ~158s |
-| Signal scoring (500 candidates) | ~0.1s |
-| Hybrid ranking | ~1s |
-| LLM reranking (150→100, Groq) | ~191s |
-| Write submission CSV | ~0.1s |
-| **Total** | **~400s (~7 min)** |
-
-Second run onwards (cached TF-IDF index): **~4 min** (index load in ~18s instead of ~158s).
-
-### Signal Score (30% of hybrid)
-| Component | Weight | What it measures |
-|-----------|--------|-----------------|
-| Engagement | 25% | Recruiter response rate + response speed |
-| Reliability | 20% | Interview completion + offer acceptance |
-| Availability | 15% | Open to work + notice period |
-| Profile Quality | 15% | Completeness + verified contacts |
-| Activity | 15% | Recency, search appearances, saved by recruiters |
-| Skill Validation | 10% | Assessment scores + GitHub activity |
-
-### Hybrid Score
-```
-hybrid = 0.45 × semantic_score + 0.30 × signal_score + 0.25 × skill_match
-final  = 0.60 × llm_score      + 0.40 × hybrid_score
-```
+---
 
 ## Scoring Breakdown
 
-### Signal Score (30% of hybrid)
+### Signal Score Components (30% of hybrid)
+
 | Component | Weight | What it measures |
 |-----------|--------|-----------------|
-| Engagement | 25% | Recruiter response rate + response speed |
-| Reliability | 20% | Interview completion + offer acceptance |
-| Availability | 15% | Open to work + notice period |
-| Profile Quality | 15% | Completeness + verified contacts |
-| Activity | 15% | Recency, search appearances, saved by recruiters |
-| Skill Validation | 10% | Assessment scores + GitHub activity |
+| Engagement | 25% | Recruiter response rate + avg response time |
+| Reliability | 20% | Interview completion rate + offer acceptance rate |
+| Availability | 15% | Open-to-work flag + notice period length |
+| Profile Quality | 15% | Completeness score + verified email/phone/LinkedIn |
+| Activity | 15% | Days since last active + search appearances + saved by recruiters |
+| Skill Validation | 10% | Platform assessment scores + GitHub activity score |
 
-### Hybrid Score
+### Score Fusion Formula
+
 ```
-hybrid = 0.45 × tfidf_score + 0.30 × signal_score + 0.25 × skill_match
-final  = 0.60 × llm_score   + 0.40 × hybrid_score
+hybrid_score = 0.45 × semantic_score
+             + 0.30 × signal_score
+             + 0.25 × skill_match
+             × experience_gate           ← multiplier: 1.0 if in range, <1 if under/over
+
+final_score  = 0.60 × llm_score
+             + 0.40 × hybrid_score
 ```
+
+---
+
+## Performance (actual benchmark on 100K candidates)
+
+| Node | First Run | Cached Run |
+|------|-----------|------------|
+| Load JD | ~1s | ~1s |
+| Parse JD (Groq LLM) | ~2s | ~2s |
+| Load 100K candidates | ~9s | ~9s |
+| ChromaDB semantic search | ~18s (model load) + 0.06s query | ~0.06s |
+| Signal scoring (500 candidates) | <1s | <1s |
+| Hybrid ranking | <1s | <1s |
+| LLM reranking (150→100, Groq) | ~200s | ~200s |
+| Write submission CSV | <1s | <1s |
+| **Total** | **~4 min** | **~4 min** |
+
+> ChromaDB index build (`embed_candidates.py`): one-time ~5 hour run on CPU.
+> After that, every pipeline run uses the pre-built index at near-zero cost.
+
+---
+
+## Submission Format
+
+The output `submission.csv` follows the challenge spec exactly:
+
+```
+candidate_id,rank,score,reasoning
+CAND_0002025,1,0.8234,"Strong ML background with 5.9y production experience..."
+CAND_0011687,2,0.8156,"Senior NLP Engineer with expertise in embeddings..."
+...
+```
+
+- 100 rows (ranks 1–100)
+- Scores non-increasing by rank
+- Validated by `India_runs_data_and_ai_challenge/validate_submission.py`

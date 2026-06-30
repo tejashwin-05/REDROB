@@ -107,7 +107,7 @@ def embedding_filter(state: dict) -> dict:
         top_k = state.get("top_k_embed", 500)
         rebuild = state.get("rebuild_index", False)
 
-        ef = EmbeddingFilter(cache_dir=cache_dir, stage2_top=1000, enable_stage2=False)
+        ef = EmbeddingFilter(cache_dir=cache_dir)
 
         # Try cache first; build if missing or forced rebuild
         loaded = False if rebuild else ef.load_index(candidates)

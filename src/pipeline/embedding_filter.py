@@ -1,15 +1,15 @@
 """
-Embedding Filter — two-stage semantic retrieval:
+Embedding Filter — semantic retrieval with automatic backend selection:
 
-Stage 1 (fast): TF-IDF + cosine similarity over all 100K candidates (~2 min)
-  → Retrieves top-1000 candidates
+  Priority 1 (best):  ChromaDB + BAAI/bge-small-en-v1.5 embeddings
+                       → true semantic search, cosine similarity
+                       → requires cache/chroma_db/ to exist (run embed_candidates.py first)
 
-Stage 2 (quality): fastembed ONNX (BAAI/bge-small-en-v1.5) over top-1000 only
-  → Reranks to produce final top-K (default 500)
+  Priority 2 (fallback): TF-IDF + cosine similarity
+                       → keyword-based, no GPU/model needed
+                       → always available, used when ChromaDB not ready
 
-Stage 2 is skipped and Stage 1 scores are used if fastembed is too slow.
-
-The TF-IDF index is cached (pickle) for fast re-use on repeated runs.
+The pipeline prints which backend is active so it's always clear.
 """
 
 from __future__ import annotations
@@ -21,8 +21,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.metrics.pairwise import cosine_similarity
 
 from src.models.candidate import Candidate
 from src.models.job_description import ParsedJD
@@ -31,206 +29,211 @@ from src.utils.text_utils import build_candidate_text
 
 logger = get_logger(__name__)
 
-# Suppress HuggingFace symlink warning on Windows
 os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
-FASTEMBED_MODEL = "BAAI/bge-small-en-v1.5"
+# ── ChromaDB config ────────────────────────────────────────────────────────
+COLLECTION_NAME  = "candidates"
+BGE_MODEL_NAME   = "BAAI/bge-small-en-v1.5"
+# Query-side prefix for BGE retrieval models
 BGE_QUERY_PREFIX = "Represent this sentence for searching relevant passages: "
 
-# TF-IDF config
+# ── TF-IDF config (fallback) ───────────────────────────────────────────────
 TFIDF_MAX_FEATURES = 25000
-TFIDF_NGRAM_RANGE = (1, 2)
+TFIDF_NGRAM_RANGE  = (1, 2)
 
 
 class EmbeddingFilter:
     """
-    Two-stage semantic filter:
-    1. TF-IDF over 100K (fast, cached)
-    2. fastembed ONNX rerank of top-1K (quality, runs on small set)
+    Semantic retrieval over 100K candidates.
+    Automatically uses ChromaDB (semantic) if available, otherwise TF-IDF.
     """
 
-    def __init__(
-        self,
-        cache_dir: str | Path = "cache",
-        stage2_top: int = 1000,   # how many to rerank in stage 2
-        enable_stage2: bool = False,  # disabled by default — LLM is the quality gate
-    ):
-        self.cache_dir = Path(cache_dir)
+    def __init__(self, cache_dir: str | Path = "cache"):
+        self.cache_dir  = Path(cache_dir)
+        self.chroma_dir = self.cache_dir / "chroma_db"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.stage2_top = stage2_top
-        self.enable_stage2 = enable_stage2
 
-        self.vectorizer: Optional[TfidfVectorizer] = None
-        self.tfidf_matrix = None          # sparse (n_candidates, n_features)
-        self.candidate_ids: List[str] = []
+        # State
         self.candidates: List[Candidate] = []
+        self._backend: str = "none"   # "chroma" | "tfidf"
 
-    # ── Cache paths ────────────────────────────────────────────────────────
-    def _tfidf_path(self) -> Path:
-        return self.cache_dir / "tfidf_vectorizer.pkl"
+        # TF-IDF state
+        self.vectorizer  = None
+        self.tfidf_matrix = None
+        self.candidate_ids: List[str] = []
 
-    def _matrix_path(self) -> Path:
-        return self.cache_dir / "tfidf_matrix.npz"
+        # ChromaDB state
+        self._chroma_collection = None
+        self._bge_model         = None
 
-    def _ids_path(self) -> Path:
-        return self.cache_dir / "candidate_ids.npy"
+    # ── Public API ─────────────────────────────────────────────────────────
 
-    # ── Stage 1: TF-IDF ────────────────────────────────────────────────────
     def build_index(self, candidates: List[Candidate]) -> None:
-        """Build TF-IDF index over all candidates and save to cache."""
-        import scipy.sparse as sp
-
+        """Build whichever index is appropriate (called when rebuild_index=True)."""
         self.candidates = candidates
-        self.candidate_ids = [c.candidate_id for c in candidates]
+        if self._chroma_ready():
+            logger.info("ChromaDB collection exists — no rebuild needed for semantic index.")
+            self._init_chroma()
+        else:
+            logger.info("ChromaDB not found — building TF-IDF index.")
+            self._build_tfidf(candidates)
 
+    def load_index(self, candidates: List[Candidate]) -> bool:
+        """Load cached index. Returns True if any cache exists."""
+        self.candidates = candidates
+        if self._chroma_ready():
+            self._init_chroma()
+            return True
+        if self._tfidf_ready():
+            self._load_tfidf(candidates)
+            return True
+        return False
+
+    def search(
+        self,
+        parsed_jd: ParsedJD,
+        top_k: int = 500,
+    ) -> List[Tuple[Candidate, float]]:
+        """Return top_k (Candidate, score) sorted by similarity descending."""
+        if self._backend == "chroma":
+            return self._chroma_search(parsed_jd, top_k)
+        elif self._backend == "tfidf":
+            return self._tfidf_search_results(parsed_jd, top_k)
+        else:
+            raise RuntimeError("No index loaded. Call build_index() or load_index() first.")
+
+    # ── ChromaDB backend ───────────────────────────────────────────────────
+
+    def _chroma_ready(self) -> bool:
+        """Check if ChromaDB collection directory exists and has data."""
+        return (self.chroma_dir / "chroma.sqlite3").exists()
+
+    def _init_chroma(self) -> None:
+        import chromadb
+        logger.info(f"Loading ChromaDB from {self.chroma_dir} ...")
+        client = chromadb.PersistentClient(path=str(self.chroma_dir))
+        self._chroma_collection = client.get_collection(COLLECTION_NAME)
+        count = self._chroma_collection.count()
+        logger.info(f"ChromaDB ready — {count} embeddings (semantic backend active)")
+        self._backend = "chroma"
+
+    def _load_bge_model(self):
+        if self._bge_model is None:
+            from sentence_transformers import SentenceTransformer
+            logger.info(f"Loading BGE model: {BGE_MODEL_NAME}")
+            self._bge_model = SentenceTransformer(BGE_MODEL_NAME, device="cpu")
+
+    def _chroma_search(
+        self, parsed_jd: ParsedJD, top_k: int
+    ) -> List[Tuple[Candidate, float]]:
+        self._load_bge_model()
+
+        query_text = BGE_QUERY_PREFIX + parsed_jd.embedding_text
+        query_emb  = self._bge_model.encode(
+            [query_text],
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+        )
+
+        logger.info(f"ChromaDB semantic search (top-{top_k})...")
+        t = time.time()
+        results = self._chroma_collection.query(
+            query_embeddings=query_emb.tolist(),
+            n_results=top_k,
+            include=["distances", "metadatas"],
+        )
+        logger.info(f"  ChromaDB query done in {time.time()-t:.2f}s")
+
+        id_map = {c.candidate_id: c for c in self.candidates}
+        output = []
+        for cid, dist in zip(results["ids"][0], results["distances"][0]):
+            candidate = id_map.get(cid)
+            if candidate:
+                # ChromaDB cosine distance: 0=identical, 2=opposite
+                # Convert to similarity: 1 - distance (range ~0 to 1)
+                similarity = float(1.0 - dist)
+                output.append((candidate, similarity))
+
+        logger.info(
+            f"Semantic search complete — top-{len(output)} candidates "
+            f"(ChromaDB / BGE-small)"
+        )
+        return output
+
+    # ── TF-IDF backend ────────────────────────────────────────────────────
+
+    def _tfidf_path(self)   -> Path: return self.cache_dir / "tfidf_vectorizer.pkl"
+    def _matrix_path(self)  -> Path: return self.cache_dir / "tfidf_matrix.npz"
+    def _ids_path(self)     -> Path: return self.cache_dir / "candidate_ids.npy"
+
+    def _tfidf_ready(self) -> bool:
+        return (
+            self._tfidf_path().exists()
+            and self._matrix_path().exists()
+            and self._ids_path().exists()
+        )
+
+    def _build_tfidf(self, candidates: List[Candidate]) -> None:
+        import scipy.sparse as sp
+        from sklearn.feature_extraction.text import TfidfVectorizer
+
+        self.candidate_ids = [c.candidate_id for c in candidates]
         logger.info(f"Building TF-IDF index for {len(candidates)} candidates...")
         t = time.time()
         texts = [build_candidate_text(c) for c in candidates]
         logger.info(f"  Texts built in {time.time()-t:.1f}s")
 
         t = time.time()
-        self.vectorizer = TfidfVectorizer(
+        self.vectorizer   = TfidfVectorizer(
             max_features=TFIDF_MAX_FEATURES,
             ngram_range=TFIDF_NGRAM_RANGE,
-            sublinear_tf=True,
-            min_df=2,
+            sublinear_tf=True, min_df=2,
         )
         self.tfidf_matrix = self.vectorizer.fit_transform(texts)
-        logger.info(
-            f"  TF-IDF fit in {time.time()-t:.1f}s — "
-            f"shape: {self.tfidf_matrix.shape}"
-        )
+        logger.info(f"  TF-IDF fit in {time.time()-t:.1f}s — shape: {self.tfidf_matrix.shape}")
 
-        # Save
         with open(self._tfidf_path(), "wb") as f:
             pickle.dump(self.vectorizer, f)
         sp.save_npz(str(self._matrix_path()), self.tfidf_matrix)
         np.save(str(self._ids_path()), np.array(self.candidate_ids))
         logger.info(f"TF-IDF index saved → {self.cache_dir}")
+        self._backend = "tfidf"
 
-    def load_index(self, candidates: List[Candidate]) -> bool:
-        """Load cached TF-IDF index. Returns True if cache hit."""
+    def _load_tfidf(self, candidates: List[Candidate]) -> None:
         import scipy.sparse as sp
-
-        if not (
-            self._tfidf_path().exists()
-            and self._matrix_path().exists()
-            and self._ids_path().exists()
-        ):
-            return False
 
         logger.info("Loading TF-IDF index from cache...")
         with open(self._tfidf_path(), "rb") as f:
             self.vectorizer = pickle.load(f)
-        self.tfidf_matrix = sp.load_npz(str(self._matrix_path()))
+        self.tfidf_matrix  = sp.load_npz(str(self._matrix_path()))
         self.candidate_ids = list(np.load(str(self._ids_path()), allow_pickle=True))
-        self.candidates = candidates
         logger.info(
             f"TF-IDF index loaded — "
             f"{self.tfidf_matrix.shape[0]} candidates, "
             f"{self.tfidf_matrix.shape[1]} features"
         )
-        return True
+        self._backend = "tfidf"
 
-    def _tfidf_search(self, jd_text: str, top_k: int) -> List[Tuple[str, float]]:
-        """Return top_k (candidate_id, score) by TF-IDF cosine similarity."""
-        assert self.vectorizer is not None, "Index not built."
-        q = self.vectorizer.transform([jd_text])
-        scores = cosine_similarity(q, self.tfidf_matrix)[0]
-        top_indices = scores.argsort()[::-1][:top_k]
-        return [(self.candidate_ids[i], float(scores[i])) for i in top_indices]
-
-    # ── Stage 2: fastembed rerank ──────────────────────────────────────────
-    def _fastembed_rerank(
-        self,
-        candidates_subset: List[Candidate],
-        jd: ParsedJD,
-        top_k: int,
+    def _tfidf_search_results(
+        self, parsed_jd: ParsedJD, top_k: int
     ) -> List[Tuple[Candidate, float]]:
-        """Rerank a small set using fastembed ONNX embeddings."""
-        try:
-            from fastembed import TextEmbedding
-
-            logger.info(
-                f"Stage 2: fastembed reranking {len(candidates_subset)} candidates..."
-            )
-            model = TextEmbedding(FASTEMBED_MODEL)
-
-            # Encode candidates
-            texts = [build_candidate_text(c) for c in candidates_subset]
-            t = time.time()
-            cand_embs = np.array(list(model.embed(texts)), dtype="float32")
-            logger.info(f"  Candidates encoded in {time.time()-t:.1f}s")
-
-            # Encode query
-            query_text = BGE_QUERY_PREFIX + jd.embedding_text
-            query_emb = np.array(list(model.embed([query_text])), dtype="float32")
-
-            # Cosine similarity (already L2-normalised by fastembed)
-            sims = (cand_embs @ query_emb.T).flatten()
-            top_indices = sims.argsort()[::-1][:top_k]
-
-            result = [
-                (candidates_subset[i], float(sims[i]))
-                for i in top_indices
-            ]
-            logger.info(f"  Stage 2 complete — top-{len(result)} returned")
-            return result
-
-        except Exception as e:
-            logger.warning(f"Stage 2 (fastembed) failed: {e} — using stage 1 scores only")
-            return []
-
-    # ── Public API ─────────────────────────────────────────────────────────
-    def search(
-        self,
-        parsed_jd: ParsedJD,
-        top_k: int = 500,
-    ) -> List[Tuple[Candidate, float]]:
-        """
-        Run two-stage search and return (Candidate, score) sorted descending.
-        """
-        assert self.vectorizer is not None, "Index not built or loaded."
+        from sklearn.metrics.pairwise import cosine_similarity
 
         id_map = {c.candidate_id: c for c in self.candidates}
+        q      = self.vectorizer.transform([parsed_jd.embedding_text])
 
-        # Stage 1: TF-IDF → top-1000
-        stage1_top = max(top_k, self.stage2_top)
-        logger.info(f"Stage 1: TF-IDF search (top-{stage1_top})...")
-        t = time.time()
-        stage1_results = self._tfidf_search(parsed_jd.embedding_text, stage1_top)
-        logger.info(f"  Stage 1 done in {time.time()-t:.2f}s")
+        logger.info(f"TF-IDF search (top-{top_k})...")
+        t      = time.time()
+        scores = cosine_similarity(q, self.tfidf_matrix)[0]
+        top_ix = scores.argsort()[::-1][:top_k]
+        logger.info(f"  TF-IDF search done in {time.time()-t:.2f}s")
 
-        # Build candidate subset for stage 2
-        stage1_candidates = [
-            id_map[cid]
-            for cid, _ in stage1_results
-            if cid in id_map
-        ]
-        stage1_score_map = {cid: s for cid, s in stage1_results}
-
-        if self.enable_stage2 and len(stage1_candidates) > 0:
-            # Stage 2: fastembed rerank top-1000
-            stage2_results = self._fastembed_rerank(
-                stage1_candidates[:self.stage2_top],
-                parsed_jd,
-                top_k=top_k,
-            )
-            if stage2_results:
-                logger.info(
-                    f"Embedding search complete — "
-                    f"top-{len(stage2_results)} from stage 2 (fastembed)"
-                )
-                return stage2_results
-
-        # Fall back to stage 1 scores only
         results = [
-            (id_map[cid], score)
-            for cid, score in stage1_results[:top_k]
-            if cid in id_map
+            (id_map[self.candidate_ids[i]], float(scores[i]))
+            for i in top_ix
+            if self.candidate_ids[i] in id_map
         ]
         logger.info(
-            f"Embedding search complete — "
-            f"top-{len(results)} from stage 1 (TF-IDF)"
+            f"Keyword search complete — top-{len(results)} candidates (TF-IDF fallback)"
         )
         return results

@@ -63,6 +63,8 @@ Job Description (.docx)
 | Fallback Retrieval | TF-IDF + cosine similarity (scikit-learn) |
 | Fuzzy Skill Match | RapidFuzz |
 | Data Models | Pydantic v2 |
+| UI | Streamlit |
+| Visualisation | Plotly |
 | Package Manager | uv |
 | Python | 3.14 |
 
@@ -84,10 +86,13 @@ cp .env.example .env
 #    Embeds all 100K candidates into ChromaDB using BGE-small
 uv run python embed_candidates.py
 
-# 4. Run the ranking pipeline
+# 4. Launch the UI (recommended)
+uv run streamlit run app.py
+
+# 5. Or run the pipeline directly from CLI
 uv run python main.py
 
-# 5. Validate the output
+# 6. Validate the output
 uv run python India_runs_data_and_ai_challenge/validate_submission.py output/submission.csv
 ```
 
@@ -96,6 +101,14 @@ uv run python India_runs_data_and_ai_challenge/validate_submission.py output/sub
 ## Commands
 
 ```bash
+# Launch the recruiter UI (recommended entry point)
+uv run streamlit run app.py
+# Opens at http://localhost:8501
+# Features: PDF JD upload, live pipeline progress, rankings, analytics, candidate deep dive
+
+# Run pipeline directly from CLI
+uv run python main.py
+
 # First run — build TF-IDF fallback index (if ChromaDB not ready)
 uv run python main.py --rebuild-index
 
@@ -163,11 +176,14 @@ Opens a browser UI at `http://localhost:8123`. The `langgraph.json` config point
 
 ```
 REDROB/
-├── main.py                          # Pipeline entry point
+├── main.py                          # Pipeline entry point (CLI)
+├── app.py                           # Streamlit UI (recruiter dashboard)
 ├── embed_candidates.py              # One-time ChromaDB index builder
 ├── langgraph.json                   # LangGraph Studio config
 ├── pyproject.toml                   # uv project + dependencies
 ├── .env.example                     # API key template
+├── .streamlit/
+│   └── config.toml                  # Streamlit theme (white + aqua green)
 ├── README.md
 ├── src/
 │   ├── data/
